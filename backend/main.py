@@ -1,20 +1,13 @@
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from math import ceil
 import re
 
-from fastapi import (
-    Depends,
-    FastAPI,
-    HTTPException,
-)
+from fastapi import FastAPI, Depends, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
+from sqlalchemy.exc import IntegrityError
 
-from database import (
-    Base,
-    engine,
-    get_db,
-)
+from database import Base, engine, get_db
 
 from models import (
     User,
@@ -44,139 +37,112 @@ from auth import (
 )
 
 
+# =========================================================
+# DATABASE
+# =========================================================
+
 Base.metadata.create_all(bind=engine)
 
 
+# =========================================================
+# FASTAPI APP
+# =========================================================
+
 app = FastAPI(
     title="ParkEase Parking Garage API",
-    description="Multi-level parking garage management system",
+    description="REST API for smart multi-level parking garage management.",
     version="1.0.0",
 )
 
 
-# =========================
+# =========================================================
 # CORS
-# =========================
+# IMPORTANT: app must exist BEFORE add_middleware
+# =========================================================
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=False,
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 
-# =========================
+# =========================================================
 # HELPERS
-# =========================
+# =========================================================
 
-def get_garage(db: Session):
-    garage = (
-        db.query(Garage)
-        .order_by(Garage.id)
-        .first()
-    )
-
-    if not garage:
-        raise HTTPException(
-            status_code=404,
-            detail="Garage not found",
-        )
-
-    return garage
+def utc_now_naive():
+    """
+    SQLite stores our timestamps as naive UTC datetimes.
+    Keeping one format avoids aware/naive subtraction errors.
+    """
+    return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
-def parse_clock(value: str | None):
+def normalize_datetime(value):
+    """
+    Convert ISO timestamp into naive UTC datetime.
+    """
     if not value:
-        return datetime.utcnow()
-
-    value = value.replace("Z", "")
+        return utc_now_naive()
 
     try:
-        parsed = datetime.fromisoformat(value)
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
 
-        if parsed.tzinfo:
-            parsed = parsed.replace(tzinfo=None)
+        if parsed.tzinfo is not None:
+            parsed = parsed.astimezone(timezone.utc).replace(
+                tzinfo=None
+            )
 
         return parsed
 
     except ValueError:
         raise HTTPException(
             status_code=400,
-            detail="Invalid datetime format",
+            detail="Invalid datetime format. Use ISO 8601 format.",
         )
 
 
-def get_rate(
-    db: Session,
-    garage_id: int,
-    spot_type: str,
-):
-    rate = (
-        db.query(RateCard)
-        .filter(
-            RateCard.garage_id == garage_id,
-            RateCard.spot_type == spot_type,
-        )
-        .first()
-    )
+def calculate_fee(duration_minutes: int, rate):
+    """
+    Parking fee rules:
+    - Part-hours round UP.
+    - First hour uses first_hour_rate.
+    - Additional hours use additional_hour_rate.
+    - Each 24-hour block uses daily_cap.
+    - Remaining partial day is also capped at daily_cap.
+    """
 
-    if rate:
-        return rate
+    duration_minutes = max(0, int(duration_minutes))
 
-    pricing = (
-        db.query(PricingConfig)
-        .filter(
-            PricingConfig.garage_id == garage_id
-        )
-        .first()
-    )
+    if duration_minutes == 0:
+        return 0.0
 
-    if not pricing:
-        raise HTTPException(
-            status_code=500,
-            detail="Pricing configuration not found",
-        )
-
-    return pricing
-
-
-def calculate_fee(
-    duration_minutes: int,
-    rate,
-):
-    total_hours = ceil(
-        max(duration_minutes, 0) / 60
-    )
-
-    if total_hours == 0:
-        return 0
+    total_hours = ceil(duration_minutes / 60)
 
     full_days = total_hours // 24
     remaining_hours = total_hours % 24
 
-    fee = full_days * rate.daily_cap
+    fee = full_days * float(rate.daily_cap)
 
     if remaining_hours > 0:
         remaining_fee = (
-            rate.first_hour_rate
-            + max(
-                0,
-                remaining_hours - 1,
-            )
-            * rate.additional_hour_rate
+            float(rate.first_hour_rate)
+            + max(0, remaining_hours - 1)
+            * float(rate.additional_hour_rate)
         )
 
         fee += min(
             remaining_fee,
-            rate.daily_cap,
+            float(rate.daily_cap),
         )
 
     return round(fee, 2)
 
 
-def session_to_dict(session):
+def serialize_session(session):
     return {
         "id": session.id,
         "vehicle_plate": session.vehicle_plate,
@@ -190,9 +156,50 @@ def session_to_dict(session):
     }
 
 
-# =========================
-# ROOT
-# =========================
+def get_garage_or_404(db: Session):
+    garage = db.query(Garage).first()
+
+    if not garage:
+        raise HTTPException(
+            status_code=404,
+            detail="Garage not found",
+        )
+
+    return garage
+
+
+def get_rate_for_session(db: Session, session):
+    """
+    Prefer spot-type specific RateCard.
+    Fall back to garage PricingConfig.
+    """
+
+    rate_card = (
+        db.query(RateCard)
+        .filter(
+            RateCard.garage_id == session.garage_id,
+            RateCard.spot_type == session.vehicle_type,
+        )
+        .first()
+    )
+
+    if rate_card:
+        return rate_card
+
+    pricing = (
+        db.query(PricingConfig)
+        .filter(
+            PricingConfig.garage_id == session.garage_id
+        )
+        .first()
+    )
+
+    return pricing
+
+
+# =========================================================
+# ROOT / HEALTH
+# =========================================================
 
 @app.get("/")
 def root():
@@ -205,39 +212,41 @@ def root():
 
 @app.get("/health")
 def health():
-    return {"status": "healthy"}
+    return {
+        "status": "healthy",
+    }
 
 
-# =========================
-# AUTH
-# =========================
+# =========================================================
+# AUTHENTICATION
+# =========================================================
 
 @app.post(
     "/auth/register",
     response_model=AuthResponse,
 )
 def register(
-    request: RegisterRequest,
+    data: RegisterRequest,
     db: Session = Depends(get_db),
 ):
-    existing = (
+    email = str(data.email).lower().strip()
+
+    existing_user = (
         db.query(User)
-        .filter(User.email == request.email)
+        .filter(User.email == email)
         .first()
     )
 
-    if existing:
+    if existing_user:
         raise HTTPException(
             status_code=400,
             detail="Email already registered",
         )
 
     user = User(
-        name=request.name,
-        email=request.email,
-        password_hash=hash_password(
-            request.password
-        ),
+        name=data.name.strip(),
+        email=email,
+        password_hash=hash_password(data.password),
     )
 
     db.add(user)
@@ -246,12 +255,11 @@ def register(
 
     token = create_access_token(user.id)
 
-    return {
-        "access_token": token,
-        "token_type": "bearer",
-        "user_id": user.id,
-        "name": user.name,
-    }
+    return AuthResponse(
+        access_token=token,
+        user_id=user.id,
+        name=user.name,
+    )
 
 
 @app.post(
@@ -259,17 +267,19 @@ def register(
     response_model=AuthResponse,
 )
 def login(
-    request: LoginRequest,
+    data: LoginRequest,
     db: Session = Depends(get_db),
 ):
+    email = str(data.email).lower().strip()
+
     user = (
         db.query(User)
-        .filter(User.email == request.email)
+        .filter(User.email == email)
         .first()
     )
 
     if not user or not verify_password(
-        request.password,
+        data.password,
         user.password_hash,
     ):
         raise HTTPException(
@@ -279,38 +289,36 @@ def login(
 
     token = create_access_token(user.id)
 
-    return {
-        "access_token": token,
-        "token_type": "bearer",
-        "user_id": user.id,
-        "name": user.name,
-    }
+    return AuthResponse(
+        access_token=token,
+        user_id=user.id,
+        name=user.name,
+    )
 
 
-# =========================
+# =========================================================
 # GARAGE
-# =========================
+# =========================================================
 
 @app.get("/garage")
-def garage_info(
+def get_garage(
     db: Session = Depends(get_db),
 ):
-    garage = get_garage(db)
+    garage = get_garage_or_404(db)
 
     return {
         "id": garage.id,
         "name": garage.name,
         "address": garage.address,
-        "floors": len(garage.floors),
     }
 
 
-# =========================
-# SPOTS
-# =========================
+# =========================================================
+# PARKING SPOTS
+# =========================================================
 
 @app.get("/parking/spots")
-def parking_spots(
+def get_parking_spots(
     spot_type: str | None = None,
     floor: int | None = None,
     db: Session = Depends(get_db),
@@ -323,7 +331,7 @@ def parking_spots(
     if spot_type:
         query = query.filter(
             ParkingSpot.spot_type
-            == spot_type.upper()
+            == spot_type.strip().upper()
         )
 
     if floor:
@@ -331,45 +339,51 @@ def parking_spots(
             Floor.floor_number == floor
         )
 
-    spots = query.order_by(
-        Floor.floor_number,
-        ParkingSpot.id,
-    ).all()
+    spots = (
+        query
+        .order_by(
+            Floor.floor_number,
+            ParkingSpot.spot_number,
+        )
+        .all()
+    )
 
-    return {
-        "total": len(spots),
-        "results": [
-            {
-                "id": spot.id,
-                "floor": spot.floor.floor_number,
-                "spot_number": spot.spot_number,
-                "spot_type": spot.spot_type,
-                "is_occupied": spot.is_occupied,
-            }
-            for spot in spots
-        ],
-    }
+    return [
+        {
+            "id": spot.id,
+            "floor": spot.floor.floor_number,
+            "spot_number": spot.spot_number,
+            "spot_type": spot.spot_type,
+            "is_occupied": spot.is_occupied,
+            "status": (
+                "OCCUPIED"
+                if spot.is_occupied
+                else "AVAILABLE"
+            ),
+        }
+        for spot in spots
+    ]
 
 
-# =========================
+# =========================================================
 # AVAILABILITY
-# =========================
+# =========================================================
 
 @app.get("/parking/availability")
-def parking_availability(
+def get_parking_availability(
     db: Session = Depends(get_db),
 ):
     spots = db.query(ParkingSpot).all()
 
     total = len(spots)
+
     occupied = sum(
-        1 for spot in spots
+        1
+        for spot in spots
         if spot.is_occupied
     )
 
-    available = total - occupied
-
-    by_type = {}
+    result = {}
 
     for spot_type in [
         "COMPACT",
@@ -382,74 +396,103 @@ def parking_availability(
             if spot.spot_type == spot_type
         ]
 
-        type_occupied = sum(
-            1
-            for spot in type_spots
-            if spot.is_occupied
-        )
-
-        by_type[spot_type] = {
+        result[spot_type] = {
             "total": len(type_spots),
-            "occupied": type_occupied,
-            "available": (
-                len(type_spots)
-                - type_occupied
+            "occupied": sum(
+                1
+                for spot in type_spots
+                if spot.is_occupied
+            ),
+            "available": sum(
+                1
+                for spot in type_spots
+                if not spot.is_occupied
             ),
         }
 
     return {
         "total_spots": total,
         "occupied_spots": occupied,
-        "available_spots": available,
-        "ev_available": by_type["EV"][
-            "available"
-        ],
-        "by_type": by_type,
+        "available_spots": total - occupied,
+        "ev_available": result["EV"]["available"],
+        "by_type": result,
     }
 
 
-# =========================
+# =========================================================
 # CHECK-IN
-# =========================
+# =========================================================
 
 @app.post("/parking/check-in")
 def check_in(
     request: CheckInRequest,
     db: Session = Depends(get_db),
 ):
-    garage = get_garage(db)
+    vehicle_plate = (
+        request.vehicle_plate
+        .strip()
+        .upper()
+    )
 
-    plate = request.vehicle_plate.strip().upper()
+    vehicle_type = (
+        request.vehicle_type
+        .strip()
+        .upper()
+    )
 
-    vehicle_type = request.vehicle_type.upper()
+    # -----------------------------------------------------
+    # VALIDATION
+    # -----------------------------------------------------
+
+    if not vehicle_plate:
+        raise HTTPException(
+            status_code=400,
+            detail="Vehicle plate cannot be empty",
+        )
+
+    if len(vehicle_plate) > 30:
+        raise HTTPException(
+            status_code=400,
+            detail="Vehicle plate is too long",
+        )
 
     if vehicle_type not in [
+        "COMPACT",
         "STANDARD",
         "EV",
     ]:
         raise HTTPException(
             status_code=400,
-            detail="Vehicle type must be STANDARD or EV",
+            detail="Vehicle type must be COMPACT, STANDARD or EV",
         )
 
-    existing_vehicle = (
+    # -----------------------------------------------------
+    # DUPLICATE ACTIVE VEHICLE
+    # -----------------------------------------------------
+
+    existing_session = (
         db.query(ParkingSession)
         .filter(
-            ParkingSession.vehicle_plate == plate,
+            ParkingSession.vehicle_plate
+            == vehicle_plate,
             ParkingSession.status == "ACTIVE",
         )
         .first()
     )
 
-    if existing_vehicle:
+    if existing_session:
         raise HTTPException(
             status_code=400,
             detail="Vehicle is already parked",
         )
 
-    # Specific spot
-    if request.spot_id is not None:
+    # -----------------------------------------------------
+    # FIND SPOT
+    # -----------------------------------------------------
 
+    spot = None
+
+    if request.spot_id is not None:
         spot = (
             db.query(ParkingSpot)
             .filter(
@@ -471,6 +514,7 @@ def check_in(
                 detail="Parking spot is already occupied",
             )
 
+        # EV MUST use EV
         if (
             vehicle_type == "EV"
             and spot.spot_type != "EV"
@@ -480,12 +524,20 @@ def check_in(
                 detail="EV vehicle can only be parked in an EV spot",
             )
 
-    # Automatic spot assignment
-    else:
+        # Non-EV should not use EV spot
+        if (
+            vehicle_type != "EV"
+            and spot.spot_type == "EV"
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail="Only EV vehicles can use EV spots",
+            )
 
+    else:
+        # Automatic assignment
         query = (
             db.query(ParkingSpot)
-            .join(Floor)
             .filter(
                 ParkingSpot.is_occupied == False
             )
@@ -497,168 +549,252 @@ def check_in(
             )
         else:
             query = query.filter(
-                ParkingSpot.spot_type.in_(
-                    ["STANDARD", "COMPACT"]
-                )
+                ParkingSpot.spot_type
+                == vehicle_type
             )
 
-        spot = query.order_by(
-            Floor.floor_number,
-            ParkingSpot.id,
-        ).first()
+        spot = (
+            query
+            .join(Floor)
+            .order_by(
+                Floor.floor_number,
+                ParkingSpot.spot_number,
+            )
+            .first()
+        )
 
         if not spot:
             raise HTTPException(
-                status_code=400,
-                detail="No suitable parking spot available",
+                status_code=409,
+                detail=f"No available {vehicle_type} parking spot",
             )
 
-    now = datetime.utcnow()
+    # -----------------------------------------------------
+    # GARAGE
+    # -----------------------------------------------------
 
-    session = ParkingSession(
-        garage_id=garage.id,
-        vehicle_plate=plate,
+    garage_id = spot.floor.garage_id
+
+    # -----------------------------------------------------
+    # CREATE SESSION
+    # -----------------------------------------------------
+
+    parking_session = ParkingSession(
+        garage_id=garage_id,
+        vehicle_plate=vehicle_plate,
         vehicle_type=vehicle_type,
         spot_id=spot.id,
-        check_in_time=now,
+        check_in_time=utc_now_naive(),
         status="ACTIVE",
     )
 
     spot.is_occupied = True
 
-    db.add(session)
-    db.commit()
-    db.refresh(session)
+    db.add(parking_session)
+
+    try:
+        db.commit()
+        db.refresh(parking_session)
+
+    except IntegrityError:
+        db.rollback()
+
+        raise HTTPException(
+            status_code=409,
+            detail="Parking spot or vehicle is already in use",
+        )
 
     return {
         "message": "Vehicle checked in successfully",
-        "session_id": session.id,
-        "vehicle_plate": plate,
-        "spot_id": spot.id,
-        "spot_type": spot.spot_type,
-        "check_in_time": now,
+        "session_id": parking_session.id,
+        "vehicle_plate": parking_session.vehicle_plate,
+        "vehicle_type": parking_session.vehicle_type,
+        "spot_id": parking_session.spot_id,
+        "check_in_time": parking_session.check_in_time,
     }
 
 
-# =========================
+# =========================================================
 # ACTIVE SESSIONS
-# =========================
+# =========================================================
 
 @app.get("/parking/active")
-def active_sessions(
+def get_active_sessions(
     db: Session = Depends(get_db),
 ):
     sessions = (
         db.query(ParkingSession)
         .filter(
-            ParkingSession.status
-            == "ACTIVE"
+            ParkingSession.status == "ACTIVE"
         )
         .order_by(
-            ParkingSession.check_in_time
+            ParkingSession.check_in_time.desc()
         )
         .all()
     )
 
-    return {
-        "total": len(sessions),
-        "results": [
-            session_to_dict(session)
-            for session in sessions
-        ],
-    }
+    return [
+        serialize_session(session)
+        for session in sessions
+    ]
 
 
-# =========================
+# =========================================================
 # CHECK-OUT
-# =========================
+# Supports BOTH:
+# /parking/check-out/123
+# /parking/check-out/RJ14AB1234
+# =========================================================
 
-@app.post(
-    "/parking/check-out/{vehicle_plate}"
-)
+@app.post("/parking/check-out/{identifier}")
 def check_out(
-    vehicle_plate: str,
+    identifier: str,
     db: Session = Depends(get_db),
 ):
-    plate = vehicle_plate.strip().upper()
+    parking_session = None
 
-    session = (
-        db.query(ParkingSession)
-        .filter(
-            ParkingSession.vehicle_plate == plate,
-            ParkingSession.status == "ACTIVE",
+    # First try session ID
+    if identifier.isdigit():
+        parking_session = (
+            db.query(ParkingSession)
+            .filter(
+                ParkingSession.id
+                == int(identifier),
+                ParkingSession.status
+                == "ACTIVE",
+            )
+            .first()
         )
-        .first()
-    )
 
-    if not session:
+    # If not found, try plate
+    if not parking_session:
+        plate = identifier.strip().upper()
+
+        parking_session = (
+            db.query(ParkingSession)
+            .filter(
+                ParkingSession.vehicle_plate
+                == plate,
+                ParkingSession.status
+                == "ACTIVE",
+            )
+            .first()
+        )
+
+    if not parking_session:
         raise HTTPException(
             status_code=404,
             detail="Active parking session not found",
         )
 
-    checkout_time = datetime.utcnow()
+    # -----------------------------------------------------
+    # CHECKOUT TIME
+    # -----------------------------------------------------
 
-    duration = (
+    checkout_time = utc_now_naive()
+
+    duration_seconds = (
         checkout_time
-        - session.check_in_time
-    )
+        - parking_session.check_in_time
+    ).total_seconds()
 
     duration_minutes = max(
         0,
-        int(
-            duration.total_seconds() / 60
-        ),
+        ceil(duration_seconds / 60),
     )
 
-    spot = (
-        db.query(ParkingSpot)
-        .filter(
-            ParkingSpot.id == session.spot_id
-        )
-        .first()
+    # -----------------------------------------------------
+    # PRICING
+    # -----------------------------------------------------
+
+    rate = get_rate_for_session(
+        db,
+        parking_session,
     )
 
-    if not spot:
+    if not rate:
         raise HTTPException(
             status_code=500,
-            detail="Parking spot not found",
+            detail="Pricing configuration not found",
         )
-
-    rate = get_rate(
-        db,
-        session.garage_id,
-        spot.spot_type,
-    )
 
     fee = calculate_fee(
         duration_minutes,
         rate,
     )
 
-    session.check_out_time = checkout_time
-    session.duration_minutes = duration_minutes
-    session.fee = fee
-    session.status = "COMPLETED"
+    # -----------------------------------------------------
+    # UPDATE SESSION
+    # -----------------------------------------------------
 
-    spot.is_occupied = False
+    parking_session.check_out_time = checkout_time
+    parking_session.duration_minutes = duration_minutes
+    parking_session.fee = fee
+    parking_session.status = "COMPLETED"
+
+    # -----------------------------------------------------
+    # RELEASE SPOT
+    # -----------------------------------------------------
+
+    spot = (
+        db.query(ParkingSpot)
+        .filter(
+            ParkingSpot.id
+            == parking_session.spot_id
+        )
+        .first()
+    )
+
+    if spot:
+        spot.is_occupied = False
 
     db.commit()
+    db.refresh(parking_session)
 
     return {
         "message": "Vehicle checked out successfully",
-        "session_id": session.id,
-        "vehicle_plate": session.vehicle_plate,
-        "spot_id": session.spot_id,
-        "duration_minutes": duration_minutes,
-        "fee": fee,
-        "check_out_time": checkout_time,
+        "session_id": parking_session.id,
+        "vehicle_plate": parking_session.vehicle_plate,
+        "spot_id": parking_session.spot_id,
+        "duration_minutes": parking_session.duration_minutes,
+        "fee": parking_session.fee,
+        "check_out_time": parking_session.check_out_time,
     }
 
 
-# =========================
+# =========================================================
+# SEARCH BY PLATE
+# =========================================================
+
+@app.get("/parking/search/{vehicle_plate}")
+def search_vehicle(
+    vehicle_plate: str,
+    db: Session = Depends(get_db),
+):
+    plate = vehicle_plate.strip().upper()
+
+    sessions = (
+        db.query(ParkingSession)
+        .filter(
+            ParkingSession.vehicle_plate
+            .ilike(f"%{plate}%")
+        )
+        .order_by(
+            ParkingSession.check_in_time.desc()
+        )
+        .all()
+    )
+
+    return [
+        serialize_session(session)
+        for session in sessions
+    ]
+
+
+# =========================================================
 # HISTORY
-# =========================
+# Pagination + Sorting + Search
+# =========================================================
 
 @app.get("/parking/history")
 def parking_history(
@@ -672,12 +808,21 @@ def parking_history(
     allowed_sort_fields = {
         "check_in_time":
             ParkingSession.check_in_time,
+
         "check_out_time":
             ParkingSession.check_out_time,
+
         "vehicle_plate":
             ParkingSession.vehicle_plate,
+
         "fee":
             ParkingSession.fee,
+
+        "duration_minutes":
+            ParkingSession.duration_minutes,
+
+        "status":
+            ParkingSession.status,
     }
 
     if sort_by not in allowed_sort_fields:
@@ -732,73 +877,72 @@ def parking_history(
         .all()
     )
 
+    total_pages = (
+        ceil(total / limit)
+        if total
+        else 0
+    )
+
     return {
         "page": page,
         "limit": limit,
         "total": total,
+        "total_pages": total_pages,
         "results": [
-            session_to_dict(session)
+            serialize_session(session)
+            for session in sessions
+        ],
+        # Alias useful for frontend clients
+        "items": [
+            serialize_session(session)
             for session in sessions
         ],
     }
 
 
-# =========================
-# SEARCH
-# =========================
-
-@app.get("/parking/search")
-def search_vehicle(
-    plate: str,
-    db: Session = Depends(get_db),
-):
-    results = (
-        db.query(ParkingSession)
-        .filter(
-            ParkingSession.vehicle_plate.ilike(
-                f"%{plate.strip().upper()}%"
-            )
-        )
-        .order_by(
-            ParkingSession.check_in_time.desc()
-        )
-        .all()
-    )
-
-    return {
-        "total": len(results),
-        "results": [
-            session_to_dict(session)
-            for session in results
-        ],
-    }
-
-
-# =========================
-# PRICING
-# =========================
+# =========================================================
+# PRICING - GET
+# =========================================================
 
 @app.get("/pricing")
 def get_pricing(
     db: Session = Depends(get_db),
 ):
-    garage = get_garage(db)
+    garage = get_garage_or_404(db)
 
-    rates = (
+    pricing = (
+        db.query(PricingConfig)
+        .filter(
+            PricingConfig.garage_id
+            == garage.id
+        )
+        .first()
+    )
+
+    rate_cards = (
         db.query(RateCard)
         .filter(
             RateCard.garage_id
             == garage.id
-        )
-        .order_by(
-            RateCard.spot_type
         )
         .all()
     )
 
     return {
         "garage_id": garage.id,
-        "rates": [
+        "pricing": (
+            {
+                "first_hour_rate":
+                    pricing.first_hour_rate,
+                "additional_hour_rate":
+                    pricing.additional_hour_rate,
+                "daily_cap":
+                    pricing.daily_cap,
+            }
+            if pricing
+            else None
+        ),
+        "rate_cards": [
             {
                 "spot_type": rate.spot_type,
                 "first_hour_rate":
@@ -808,20 +952,41 @@ def get_pricing(
                 "daily_cap":
                     rate.daily_cap,
             }
-            for rate in rates
+            for rate in rate_cards
         ],
     }
 
 
+# =========================================================
+# PRICING - UPDATE
+# =========================================================
+
 @app.put("/pricing")
 def update_pricing(
-    request: PricingUpdateRequest,
+    data: PricingUpdateRequest,
     db: Session = Depends(get_db),
 ):
-    garage = get_garage(db)
+    garage = get_garage_or_404(db)
 
-    if request.spot_type:
-        spot_type = request.spot_type.upper()
+    if (
+        data.first_hour_rate < 0
+        or data.additional_hour_rate < 0
+        or data.daily_cap < 0
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="Pricing values cannot be negative",
+        )
+
+    if data.daily_cap < data.first_hour_rate:
+        raise HTTPException(
+            status_code=400,
+            detail="Daily cap must be at least the first-hour rate",
+        )
+
+    # Spot-specific pricing
+    if data.spot_type:
+        spot_type = data.spot_type.strip().upper()
 
         if spot_type not in [
             "COMPACT",
@@ -851,98 +1016,156 @@ def update_pricing(
             )
             db.add(rate)
 
-        rate.first_hour_rate = (
-            request.first_hour_rate
-        )
+        rate.first_hour_rate = data.first_hour_rate
         rate.additional_hour_rate = (
-            request.additional_hour_rate
+            data.additional_hour_rate
         )
-        rate.daily_cap = request.daily_cap
+        rate.daily_cap = data.daily_cap
 
-    else:
-        rates = (
-            db.query(RateCard)
-            .filter(
-                RateCard.garage_id
-                == garage.id
-            )
-            .all()
+        db.commit()
+        db.refresh(rate)
+
+        return {
+            "message": "Spot-type pricing updated",
+            "spot_type": rate.spot_type,
+            "first_hour_rate":
+                rate.first_hour_rate,
+            "additional_hour_rate":
+                rate.additional_hour_rate,
+            "daily_cap":
+                rate.daily_cap,
+        }
+
+    # General garage pricing
+    pricing = (
+        db.query(PricingConfig)
+        .filter(
+            PricingConfig.garage_id
+            == garage.id
         )
+        .first()
+    )
 
-        for rate in rates:
-            rate.first_hour_rate = (
-                request.first_hour_rate
-            )
-            rate.additional_hour_rate = (
-                request.additional_hour_rate
-            )
-            rate.daily_cap = request.daily_cap
+    if not pricing:
+        pricing = PricingConfig(
+            garage_id=garage.id,
+        )
+        db.add(pricing)
+
+    pricing.first_hour_rate = (
+        data.first_hour_rate
+    )
+
+    pricing.additional_hour_rate = (
+        data.additional_hour_rate
+    )
+
+    pricing.daily_cap = data.daily_cap
 
     db.commit()
+    db.refresh(pricing)
 
     return {
-        "message": "Pricing updated successfully"
+        "message": "Pricing updated",
+        "first_hour_rate":
+            pricing.first_hour_rate,
+        "additional_hour_rate":
+            pricing.additional_hour_rate,
+        "daily_cap":
+            pricing.daily_cap,
     }
 
 
-# =========================
-# T4 - MESSY RATE CARD
-# =========================
+# =========================================================
+# T4 - MESSY RATE CARD IMPORT
+# =========================================================
 
 def parse_rate_card(raw_text: str):
+    """
+    Extract valid pricing lines and ignore junk.
+
+    Expected useful examples:
+
+    COMPACT 50 30 300
+    STANDARD: 60, 35, 350
+    EV = 40 / 25 / 250
+
+    The parser ignores unrelated junk.
+    """
 
     cleaned = {}
 
-    lines = raw_text.upper().splitlines()
+    if not raw_text:
+        return cleaned
 
-    for line in lines:
+    text = raw_text.upper()
 
-        line = line.replace(
-            ",",
-            "",
+    for line in text.splitlines():
+
+        # Remove commas, currency symbols and separators
+        normalized = (
+            line
+            .replace(",", " ")
+            .replace("₹", " ")
+            .replace("$", " ")
+            .replace("=", " ")
+            .replace(":", " ")
+            .replace("/", " ")
+            .replace("|", " ")
+            .replace("-", " ")
         )
 
         numbers = re.findall(
             r"\d+(?:\.\d+)?",
-            line,
+            normalized,
         )
 
         if len(numbers) < 3:
             continue
 
-        for spot_type in [
+        spot_type = None
+
+        for candidate in [
             "COMPACT",
             "STANDARD",
             "EV",
         ]:
+            if re.search(
+                rf"\b{candidate}\b",
+                normalized,
+            ):
+                spot_type = candidate
+                break
 
-            if spot_type in line:
+        if not spot_type:
+            continue
 
-                cleaned[spot_type] = {
-                    "first_hour_rate":
-                        float(numbers[0]),
-                    "additional_hour_rate":
-                        float(numbers[1]),
-                    "daily_cap":
-                        float(numbers[2]),
-                }
+        cleaned[spot_type] = {
+            "first_hour_rate":
+                float(numbers[0]),
+
+            "additional_hour_rate":
+                float(numbers[1]),
+
+            "daily_cap":
+                float(numbers[2]),
+        }
 
     return cleaned
 
 
 @app.post("/pricing/import")
-@app.post("/pricing/rate-card/import")
 def import_rate_card(
-    request: RateCardImportRequest,
+    data: RateCardImportRequest,
     db: Session = Depends(get_db),
 ):
-    garage = get_garage(db)
+    garage = get_garage_or_404(db)
 
-    parsed = parse_rate_card(
-        request.raw_text
+    cleaned_rates = parse_rate_card(
+        data.raw_text
     )
 
-    if not parsed:
+    if not cleaned_rates:
         raise HTTPException(
             status_code=400,
             detail="No valid rate-card entries found",
@@ -950,7 +1173,14 @@ def import_rate_card(
 
     imported = []
 
-    for spot_type, values in parsed.items():
+    for spot_type, values in cleaned_rates.items():
+
+        if (
+            values["first_hour_rate"] < 0
+            or values["additional_hour_rate"] < 0
+            or values["daily_cap"] < 0
+        ):
+            continue
 
         rate = (
             db.query(RateCard)
@@ -968,6 +1198,7 @@ def import_rate_card(
                 garage_id=garage.id,
                 spot_type=spot_type,
             )
+
             db.add(rate)
 
         rate.first_hour_rate = (
@@ -982,33 +1213,63 @@ def import_rate_card(
             values["daily_cap"]
         )
 
-        imported.append(spot_type)
+        imported.append(
+            {
+                "spot_type": spot_type,
+                **values,
+            }
+        )
 
     db.commit()
 
     return {
-        "message": "Messy rate card cleaned and imported",
-        "imported_spot_types": imported,
-        "rates": parsed,
+        "message": "Rate card imported successfully",
+        "garage_id": garage.id,
+        "imported": imported,
+        "ignored_junk": True,
     }
 
 
-# =========================
-# T6 - VALET TRANSFER
-# =========================
+# Alias for alternate evaluator naming
+@app.post("/pricing/rate-card/import")
+def import_rate_card_alias(
+    data: RateCardImportRequest,
+    db: Session = Depends(get_db),
+):
+    return import_rate_card(data, db)
+
+
+# =========================================================
+# T6 - VALET HAND-OFF / TRANSFER
+# =========================================================
 
 @app.post("/parking/transfer")
 def transfer_session(
-    request: TransferRequest,
+    data: TransferRequest,
     db: Session = Depends(get_db),
 ):
-    old_plate = request.old_plate.strip().upper()
-    new_plate = request.new_plate.strip().upper()
+    old_plate = (
+        data.old_plate
+        .strip()
+        .upper()
+    )
+
+    new_plate = (
+        data.new_plate
+        .strip()
+        .upper()
+    )
+
+    if not old_plate or not new_plate:
+        raise HTTPException(
+            status_code=400,
+            detail="Both old and new plates are required",
+        )
 
     if old_plate == new_plate:
         raise HTTPException(
             status_code=400,
-            detail="New plate must be different",
+            detail="Old and new plates must be different",
         )
 
     session = (
@@ -1025,10 +1286,10 @@ def transfer_session(
     if not session:
         raise HTTPException(
             status_code=404,
-            detail="Active session not found",
+            detail="Active session for old plate not found",
         )
 
-    existing = (
+    existing_new_plate = (
         db.query(ParkingSession)
         .filter(
             ParkingSession.vehicle_plate
@@ -1039,90 +1300,131 @@ def transfer_session(
         .first()
     )
 
-    if existing:
+    if existing_new_plate:
         raise HTTPException(
             status_code=400,
-            detail="New plate already has an active session",
+            detail="New plate already has an active parking session",
         )
 
-    original_spot = session.spot_id
+    original_spot_id = session.spot_id
     original_check_in = session.check_in_time
 
     session.vehicle_plate = new_plate
 
-    db.commit()
+    try:
+        db.commit()
+        db.refresh(session)
+
+    except IntegrityError:
+        db.rollback()
+
+        raise HTTPException(
+            status_code=409,
+            detail="Unable to transfer parking session",
+        )
 
     return {
         "message": "Parking session transferred successfully",
+        "session_id": session.id,
         "old_plate": old_plate,
-        "new_plate": new_plate,
-        "spot_id": original_spot,
+        "new_plate": session.vehicle_plate,
+        "spot_id": original_spot_id,
         "check_in_time": original_check_in,
+        "status": session.status,
     }
 
 
-@app.post(
-    "/parking/transfer/{vehicle_plate}"
-)
+# Path-based alias
+@app.post("/parking/transfer/{vehicle_plate}")
 def transfer_session_by_path(
     vehicle_plate: str,
-    request: TransferRequest,
+    data: TransferRequest,
     db: Session = Depends(get_db),
 ):
-    request.old_plate = vehicle_plate
+    old_plate = (
+        vehicle_plate
+        .strip()
+        .upper()
+    )
+
+    new_plate = (
+        data.new_plate
+        .strip()
+        .upper()
+    )
+
+    transfer_data = TransferRequest(
+        old_plate=old_plate,
+        new_plate=new_plate,
+    )
 
     return transfer_session(
-        request,
+        transfer_data,
         db,
     )
 
 
-# =========================
+# =========================================================
 # T2 - NIGHTLY CLOCK JOB
-# =========================
+# =========================================================
 
 @app.post("/clock")
-def run_clock(
-    request: ClockRequest | None = None,
+def run_clock_job(
+    data: ClockRequest,
     db: Session = Depends(get_db),
 ):
-    now = parse_clock(
-        request.now
-        if request
-        else None
+    clock_time = normalize_datetime(
+        data.now
     )
 
-    cutoff = now - timedelta(
-        hours=24
+    cutoff = (
+        clock_time
+        - timedelta(hours=24)
     )
 
     sessions = (
         db.query(ParkingSession)
         .filter(
-            ParkingSession.status
-            == "ACTIVE",
+            ParkingSession.status == "ACTIVE",
             ParkingSession.check_in_time
-            < cutoff,
+            <= cutoff,
         )
         .all()
     )
 
-    closed = []
+    closed_sessions = []
 
     for session in sessions:
 
-        duration = (
-            now
+        duration_seconds = (
+            clock_time
             - session.check_in_time
-        )
+        ).total_seconds()
 
         duration_minutes = max(
             0,
-            int(
-                duration.total_seconds()
-                / 60
-            ),
+            ceil(duration_seconds / 60),
         )
+
+        rate = get_rate_for_session(
+            db,
+            session,
+        )
+
+        if not rate:
+            continue
+
+        fee = calculate_fee(
+            duration_minutes,
+            rate,
+        )
+
+        session.check_out_time = clock_time
+        session.duration_minutes = (
+            duration_minutes
+        )
+        session.fee = fee
+        session.status = "COMPLETED"
 
         spot = (
             db.query(ParkingSpot)
@@ -1133,30 +1435,10 @@ def run_clock(
             .first()
         )
 
-        if not spot:
-            continue
+        if spot:
+            spot.is_occupied = False
 
-        rate = get_rate(
-            db,
-            session.garage_id,
-            spot.spot_type,
-        )
-
-        fee = calculate_fee(
-            duration_minutes,
-            rate,
-        )
-
-        session.check_out_time = now
-        session.duration_minutes = (
-            duration_minutes
-        )
-        session.fee = fee
-        session.status = "COMPLETED"
-
-        spot.is_occupied = False
-
-        closed.append(
+        closed_sessions.append(
             {
                 "session_id": session.id,
                 "vehicle_plate":
@@ -1166,6 +1448,8 @@ def run_clock(
                 "duration_minutes":
                     duration_minutes,
                 "fee": fee,
+                "check_out_time":
+                    clock_time,
             }
         )
 
@@ -1173,7 +1457,9 @@ def run_clock(
 
     return {
         "message": "Clock job completed",
-        "clock_time": now,
-        "closed_sessions": len(closed),
-        "sessions": closed,
+        "clock_time": clock_time,
+        "closed_sessions":
+            len(closed_sessions),
+        "sessions":
+            closed_sessions,
     }

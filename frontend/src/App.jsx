@@ -1,14 +1,61 @@
 import { useEffect, useState } from "react";
 import "./App.css";
 
-const API = `${window.location.protocol}//${window.location.hostname.replace(
-  "5173",
-  "8000"
-)}`;
+/* =========================================================
+   API URL
+   Works locally and in GitHub Codespaces
+   ========================================================= */
 
-function App() {
-  const [loggedIn, setLoggedIn] = useState(
-    !!localStorage.getItem("token")
+const API = window.location.hostname.includes("app.github.dev")
+  ? `${window.location.protocol}//${window.location.hostname.replace(
+      /-\d+\.app\.github\.dev$/,
+      "-8000.app.github.dev"
+    )}`
+  : "http://localhost:8000";
+
+
+/* =========================================================
+   API HELPER
+   ========================================================= */
+
+async function apiRequest(endpoint, options = {}) {
+  const response = await fetch(`${API}${endpoint}`, {
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...(options.headers || {}),
+    },
+  });
+
+  let data;
+
+  try {
+    data = await response.json();
+  } catch {
+    data = {};
+  }
+
+  if (!response.ok) {
+    throw new Error(
+      data.detail || data.message || "Something went wrong"
+    );
+  }
+
+  return data;
+}
+
+
+/* =========================================================
+   APP
+   ========================================================= */
+
+export default function App() {
+  const [token, setToken] = useState(
+    localStorage.getItem("parkease_token")
+  );
+
+  const [userName, setUserName] = useState(
+    localStorage.getItem("parkease_name") || ""
   );
 
   const [authMode, setAuthMode] = useState("login");
@@ -17,22 +64,54 @@ function App() {
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
 
-  const [availability, setAvailability] =
-    useState(null);
+  const [error, setError] = useState("");
+  const [message, setMessage] = useState("");
+  const [loading, setLoading] = useState(false);
 
-  const [history, setHistory] = useState([]);
-  const [active, setActive] = useState([]);
+  const [garage, setGarage] = useState(null);
+  const [availability, setAvailability] = useState(null);
+  const [spots, setSpots] = useState([]);
+  const [activeSessions, setActiveSessions] = useState([]);
+  const [history, setHistory] = useState(null);
 
   const [plate, setPlate] = useState("");
-  const [vehicleType, setVehicleType] =
-    useState("STANDARD");
+  const [vehicleType, setVehicleType] = useState("STANDARD");
 
-  const [spotId, setSpotId] = useState("");
+  const [searchPlate, setSearchPlate] = useState("");
+  const [searchResults, setSearchResults] = useState([]);
 
-  const [search, setSearch] = useState("");
-  const [message, setMessage] = useState("");
+  const [page, setPage] = useState(1);
 
-  const handleAuth = async () => {
+  const [selectedSpot, setSelectedSpot] = useState("");
+
+  const [pricing, setPricing] = useState(null);
+
+  const [oldPlate, setOldPlate] = useState("");
+  const [newPlate, setNewPlate] = useState("");
+
+  const [rateCardText, setRateCardText] = useState(
+    `COMPACT 50 30 300
+STANDARD 60 35 350
+EV 40 25 250
+
+junk text
+invalid row`
+  );
+
+  const [clockTime, setClockTime] = useState("");
+
+
+  /* =======================================================
+     AUTH
+     ======================================================= */
+
+  async function handleAuth(e) {
+    e.preventDefault();
+
+    setError("");
+    setMessage("");
+    setLoading(true);
+
     try {
       const endpoint =
         authMode === "login"
@@ -51,119 +130,102 @@ function App() {
               password,
             };
 
-      const response = await fetch(
-        `${API}${endpoint}`,
-        {
-          method: "POST",
-          headers: {
-            "Content-Type":
-              "application/json",
-          },
-          body: JSON.stringify(body),
-        }
-      );
-
-      const data = await response.json();
-
-      if (!response.ok) {
-        setMessage(
-          data.detail ||
-            "Authentication failed."
-        );
-        return;
-      }
+      const data = await apiRequest(endpoint, {
+        method: "POST",
+        body: JSON.stringify(body),
+      });
 
       localStorage.setItem(
-        "token",
+        "parkease_token",
         data.access_token
       );
 
-      setLoggedIn(true);
+      localStorage.setItem(
+        "parkease_name",
+        data.name
+      );
+
+      setToken(data.access_token);
+      setUserName(data.name);
 
       setMessage(
         authMode === "login"
           ? "Login successful!"
-          : "Registration successful!"
+          : "Account created successfully!"
       );
-    } catch {
-      setMessage(
-        "Unable to connect to backend."
-      );
+
+      setPassword("");
+
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setLoading(false);
     }
-  };
+  }
 
-  const logout = () => {
-    localStorage.removeItem("token");
-    setLoggedIn(false);
-    setMessage("");
-  };
 
-  const loadDashboard = async () => {
+  function logout() {
+    localStorage.removeItem("parkease_token");
+    localStorage.removeItem("parkease_name");
+
+    setToken(null);
+    setUserName("");
+  }
+
+
+  /* =======================================================
+     DASHBOARD DATA
+     ======================================================= */
+
+  async function loadDashboard() {
     try {
       const [
-        availabilityRes,
-        historyRes,
-        activeRes,
+        garageData,
+        availabilityData,
+        spotsData,
+        activeData,
+        historyData,
+        pricingData,
       ] = await Promise.all([
-        fetch(
-          `${API}/parking/availability`
+        apiRequest("/garage"),
+        apiRequest("/parking/availability"),
+        apiRequest("/parking/spots"),
+        apiRequest("/parking/active"),
+        apiRequest(
+          `/parking/history?page=${page}&limit=10&sort_by=check_in_time&order=desc`
         ),
-        fetch(
-          `${API}/parking/history?page=1&limit=10&sort_by=check_in_time&order=desc`
-        ),
-        fetch(`${API}/parking/active`),
+        apiRequest("/pricing"),
       ]);
 
-      if (
-        !availabilityRes.ok ||
-        !historyRes.ok ||
-        !activeRes.ok
-      ) {
-        throw new Error();
-      }
+      setGarage(garageData);
+      setAvailability(availabilityData);
+      setSpots(spotsData);
+      setActiveSessions(activeData);
+      setHistory(historyData);
+      setPricing(pricingData);
 
-      const availabilityData =
-        await availabilityRes.json();
-
-      const historyData =
-        await historyRes.json();
-
-      const activeData =
-        await activeRes.json();
-
-      setAvailability(
-        availabilityData
-      );
-
-      setHistory(
-        historyData.results || []
-      );
-
-      setActive(
-        activeData.results || []
-      );
-
-      setMessage("");
-    } catch {
-      setMessage(
-        "Backend connection failed."
-      );
+    } catch (err) {
+      setError(err.message);
     }
-  };
+  }
+
 
   useEffect(() => {
-    if (loggedIn) {
+    if (token) {
       loadDashboard();
     }
-  }, [loggedIn]);
+  }, [token, page]);
 
-  const checkIn = async () => {
-    if (!plate) {
-      setMessage(
-        "Please enter vehicle plate."
-      );
-      return;
-    }
+
+  /* =======================================================
+     CHECK-IN
+     ======================================================= */
+
+  async function handleCheckIn(e) {
+    e.preventDefault();
+
+    setError("");
+    setMessage("");
 
     try {
       const body = {
@@ -171,126 +233,212 @@ function App() {
         vehicle_type: vehicleType,
       };
 
-      if (spotId) {
-        body.spot_id = Number(spotId);
+      if (selectedSpot) {
+        body.spot_id = Number(selectedSpot);
       }
 
-      const response = await fetch(
-        `${API}/parking/check-in`,
+      const data = await apiRequest(
+        "/parking/check-in",
         {
           method: "POST",
-          headers: {
-            "Content-Type":
-              "application/json",
-          },
           body: JSON.stringify(body),
         }
       );
 
-      const data = await response.json();
-
-      if (!response.ok) {
-        setMessage(
-          data.detail ||
-            "Check-in failed."
-        );
-        return;
-      }
-
       setMessage(
-        `Vehicle ${data.vehicle_plate} checked in at Spot ${data.spot_id}.`
+        `Vehicle ${data.vehicle_plate} checked in successfully. Spot ${data.spot_id} assigned.`
       );
 
       setPlate("");
-      setSpotId("");
+      setSelectedSpot("");
 
-      loadDashboard();
-    } catch {
-      setMessage("Check-in failed.");
+      await loadDashboard();
+
+    } catch (err) {
+      setError(err.message);
     }
-  };
+  }
 
-  const checkOut = async (
-    vehiclePlate
-  ) => {
+
+  /* =======================================================
+     CHECK-OUT
+     ======================================================= */
+
+  async function handleCheckout(identifier) {
+    setError("");
+    setMessage("");
+
     try {
-      const response = await fetch(
-        `${API}/parking/check-out/${encodeURIComponent(
-          vehiclePlate
-        )}`,
+      const data = await apiRequest(
+        `/parking/check-out/${encodeURIComponent(identifier)}`,
         {
           method: "POST",
         }
       );
-
-      const data = await response.json();
-
-      if (!response.ok) {
-        setMessage(
-          data.detail ||
-            "Checkout failed."
-        );
-        return;
-      }
 
       setMessage(
         `Checkout successful. Fee: ₹${data.fee}`
       );
 
-      loadDashboard();
-    } catch {
-      setMessage(
-        "Checkout failed."
-      );
-    }
-  };
+      await loadDashboard();
 
-  const searchVehicle = async () => {
-    if (!search.trim()) {
-      loadDashboard();
+    } catch (err) {
+      setError(err.message);
+    }
+  }
+
+
+  /* =======================================================
+     SEARCH
+     ======================================================= */
+
+  async function handleSearch(e) {
+    e.preventDefault();
+
+    setError("");
+
+    if (!searchPlate.trim()) {
+      setSearchResults([]);
       return;
     }
 
     try {
-      const response = await fetch(
-        `${API}/parking/search?plate=${encodeURIComponent(
-          search.trim()
+      const data = await apiRequest(
+        `/parking/search/${encodeURIComponent(
+          searchPlate.trim()
         )}`
       );
 
-      const data = await response.json();
+      setSearchResults(data);
 
-      if (!response.ok) {
-        setMessage(
-          data.detail ||
-            "Search failed."
-        );
-        return;
-      }
+    } catch (err) {
+      setError(err.message);
+    }
+  }
 
-      setHistory(
-        data.results || []
+
+  /* =======================================================
+     TRANSFER - T6
+     ======================================================= */
+
+  async function handleTransfer(e) {
+    e.preventDefault();
+
+    setError("");
+    setMessage("");
+
+    try {
+      const data = await apiRequest(
+        "/parking/transfer",
+        {
+          method: "POST",
+          body: JSON.stringify({
+            old_plate: oldPlate,
+            new_plate: newPlate,
+          }),
+        }
       );
 
       setMessage(
-        `${data.total || 0} record(s) found.`
+        `Transfer successful: ${data.old_plate} → ${data.new_plate}. Spot ${data.spot_id} retained.`
       );
-    } catch {
-      setMessage("Search failed.");
+
+      setOldPlate("");
+      setNewPlate("");
+
+      await loadDashboard();
+
+    } catch (err) {
+      setError(err.message);
     }
-  };
+  }
 
-  if (!loggedIn) {
+
+  /* =======================================================
+     RATE CARD IMPORT - T4
+     ======================================================= */
+
+  async function handleRateCardImport(e) {
+    e.preventDefault();
+
+    setError("");
+    setMessage("");
+
+    try {
+      const data = await apiRequest(
+        "/pricing/import",
+        {
+          method: "POST",
+          body: JSON.stringify({
+            raw_text: rateCardText,
+          }),
+        }
+      );
+
+      setMessage(
+        `Rate card imported. ${data.imported.length} rate types cleaned successfully.`
+      );
+
+      await loadDashboard();
+
+    } catch (err) {
+      setError(err.message);
+    }
+  }
+
+
+  /* =======================================================
+     CLOCK - T2
+     ======================================================= */
+
+  async function handleClock(e) {
+    e.preventDefault();
+
+    setError("");
+    setMessage("");
+
+    try {
+      const data = await apiRequest(
+        "/clock",
+        {
+          method: "POST",
+          body: JSON.stringify({
+            now: clockTime || null,
+          }),
+        }
+      );
+
+      setMessage(
+        `Nightly job completed. ${data.closed_sessions} session(s) automatically closed and billed.`
+      );
+
+      await loadDashboard();
+
+    } catch (err) {
+      setError(err.message);
+    }
+  }
+
+
+  /* =======================================================
+     LOGIN / REGISTER SCREEN
+     ======================================================= */
+
+  if (!token) {
     return (
-      <div className="auth-page">
-        <div className="auth-card">
-          <h1>ParkEase</h1>
+      <div className="app">
 
-          <p className="auth-subtitle">
-            Smart Parking Garage Management
-          </p>
+        <div className="auth-card">
+
+          <div className="brand">
+            <h1>ParkEase</h1>
+            <p>
+              Smart Parking Garage Management
+            </p>
+          </div>
 
           <div className="auth-tabs">
+
             <button
               className={
                 authMode === "login"
@@ -299,6 +447,7 @@ function App() {
               }
               onClick={() => {
                 setAuthMode("login");
+                setError("");
                 setMessage("");
               }}
             >
@@ -313,386 +462,935 @@ function App() {
               }
               onClick={() => {
                 setAuthMode("register");
+                setError("");
                 setMessage("");
               }}
             >
               Register
             </button>
+
           </div>
 
-          {authMode === "register" && (
+          <form onSubmit={handleAuth}>
+
+            {authMode === "register" && (
+              <input
+                type="text"
+                placeholder="Full name"
+                value={name}
+                onChange={(e) =>
+                  setName(e.target.value)
+                }
+                required
+              />
+            )}
+
             <input
-              placeholder="Full Name"
-              value={name}
+              type="email"
+              placeholder="Email"
+              value={email}
               onChange={(e) =>
-                setName(e.target.value)
+                setEmail(e.target.value)
               }
+              required
             />
+
+            <input
+              type="password"
+              placeholder="Password"
+              value={password}
+              onChange={(e) =>
+                setPassword(e.target.value)
+              }
+              required
+            />
+
+            <button
+              className="primary-btn"
+              disabled={loading}
+              type="submit"
+            >
+              {loading
+                ? "Please wait..."
+                : authMode === "login"
+                ? "Login"
+                : "Create Account"}
+            </button>
+
+          </form>
+
+          {error && (
+            <div className="error">
+              {error}
+            </div>
           )}
 
-          <input
-            type="email"
-            placeholder="Email"
-            value={email}
-            onChange={(e) =>
-              setEmail(e.target.value)
-            }
-          />
-
-          <input
-            type="password"
-            placeholder="Password"
-            value={password}
-            onChange={(e) =>
-              setPassword(e.target.value)
-            }
-          />
-
-          <button
-            className="primary-button"
-            onClick={handleAuth}
-          >
-            {authMode === "login"
-              ? "Login"
-              : "Create Account"}
-          </button>
-
           {message && (
-            <div className="message">
+            <div className="success">
               {message}
             </div>
           )}
+
         </div>
+
+        <LandingSection />
+
       </div>
     );
   }
 
+
+  /* =======================================================
+     DASHBOARD
+     ======================================================= */
+
   return (
-    <div className="app">
-      <header>
+    <div className="dashboard">
+
+      <header className="topbar">
+
         <div>
           <h1>ParkEase</h1>
-          <p>
+          <span>
             Smart Parking Garage Management
-          </p>
+          </span>
         </div>
 
-        <div className="header-actions">
-          <button onClick={loadDashboard}>
-            Refresh
-          </button>
+        <div className="user-area">
+          <span>Welcome, {userName}</span>
 
-          <button onClick={logout}>
+          <button
+            className="logout-btn"
+            onClick={logout}
+          >
             Logout
           </button>
         </div>
+
       </header>
 
-      <section className="hero">
-        <h2>
-          Manage your parking garage with ease.
-        </h2>
 
-        <p>
-          Track availability, check vehicles
-          in and out, calculate parking fees,
-          and search parking history.
-        </p>
-      </section>
+      <main className="container">
 
-      {message && (
-        <div className="message">
-          {message}
-        </div>
-      )}
-
-      <section className="stats">
-        <div className="card">
-          <h3>Total Spots</h3>
-          <strong>
-            {availability?.total_spots ?? "-"}
-          </strong>
-        </div>
-
-        <div className="card">
-          <h3>Available</h3>
-          <strong>
-            {availability?.available_spots ?? "-"}
-          </strong>
-        </div>
-
-        <div className="card">
-          <h3>Occupied</h3>
-          <strong>
-            {availability?.occupied_spots ?? "-"}
-          </strong>
-        </div>
-
-        <div className="card">
-          <h3>EV Available</h3>
-          <strong>
-            {availability?.ev_available ?? "-"}
-          </strong>
-        </div>
-      </section>
-
-      <section className="panel">
-        <h2>Spot Availability</h2>
-
-        <div className="availability-grid">
-          {[
-            "COMPACT",
-            "STANDARD",
-            "EV",
-          ].map((type) => (
-            <div
-              className="availability-card"
-              key={type}
-            >
-              <h3>{type}</h3>
-
-              <p>
-                Available:{" "}
-                <strong>
-                  {availability
-                    ?.by_type?.[type]
-                    ?.available ?? "-"}
-                </strong>
-              </p>
-
-              <p>
-                Occupied:{" "}
-                {availability
-                  ?.by_type?.[type]
-                  ?.occupied ?? "-"}
-              </p>
-
-              <p>
-                Total:{" "}
-                {availability
-                  ?.by_type?.[type]
-                  ?.total ?? "-"}
-              </p>
-            </div>
-          ))}
-        </div>
-      </section>
-
-      <section className="panel">
-        <h2>Vehicle Check-In</h2>
-
-        <div className="form">
-          <input
-            placeholder="Vehicle Plate"
-            value={plate}
-            onChange={(e) =>
-              setPlate(e.target.value)
-            }
-          />
-
-          <select
-            value={vehicleType}
-            onChange={(e) =>
-              setVehicleType(e.target.value)
-            }
-          >
-            <option value="STANDARD">
-              Standard
-            </option>
-
-            <option value="EV">
-              EV
-            </option>
-          </select>
-
-          <input
-            type="number"
-            placeholder="Spot ID (optional)"
-            value={spotId}
-            onChange={(e) =>
-              setSpotId(e.target.value)
-            }
-          />
-
-          <button onClick={checkIn}>
-            Check In
-          </button>
-        </div>
-
-        <p className="hint">
-          Leave Spot ID empty for automatic
-          suitable spot assignment.
-        </p>
-      </section>
-
-      <section className="panel">
-        <h2>Currently Parked</h2>
-
-        {active.length === 0 ? (
-          <p>
-            No vehicles currently parked.
-          </p>
-        ) : (
-          <div className="table-wrap">
-            <table>
-              <thead>
-                <tr>
-                  <th>Plate</th>
-                  <th>Type</th>
-                  <th>Spot</th>
-                  <th>Check-In</th>
-                  <th>Action</th>
-                </tr>
-              </thead>
-
-              <tbody>
-                {active.map((item) => (
-                  <tr key={item.id}>
-                    <td>
-                      {item.vehicle_plate}
-                    </td>
-
-                    <td>
-                      {item.vehicle_type}
-                    </td>
-
-                    <td>
-                      {item.spot_id}
-                    </td>
-
-                    <td>
-                      {new Date(
-                        item.check_in_time
-                      ).toLocaleString()}
-                    </td>
-
-                    <td>
-                      <button
-                        onClick={() =>
-                          checkOut(
-                            item.vehicle_plate
-                          )
-                        }
-                      >
-                        Check Out
-                      </button>
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
+        {error && (
+          <div className="error banner">
+            {error}
           </div>
         )}
-      </section>
 
-      <section className="panel">
-        <div className="search-row">
-          <h2>Parking History</h2>
+        {message && (
+          <div className="success banner">
+            {message}
+          </div>
+        )}
 
-          <div className="search-box">
+
+        {/* =================================================
+            GARAGE INFO
+            ================================================= */}
+
+        {garage && (
+          <section className="hero-card">
+
+            <div>
+              <h2>{garage.name}</h2>
+
+              <p>
+                {garage.address}
+              </p>
+            </div>
+
+            <div>
+              <strong>
+                Multi-level parking
+              </strong>
+              <p>
+                EV-ready • Automated billing
+              </p>
+            </div>
+
+          </section>
+        )}
+
+
+        {/* =================================================
+            STATS
+            ================================================= */}
+
+        {availability && (
+          <section className="stats-grid">
+
+            <StatCard
+              title="Total Spots"
+              value={availability.total_spots}
+            />
+
+            <StatCard
+              title="Available"
+              value={availability.available_spots}
+            />
+
+            <StatCard
+              title="Occupied"
+              value={availability.occupied_spots}
+            />
+
+            <StatCard
+              title="EV Available"
+              value={availability.ev_available}
+            />
+
+          </section>
+        )}
+
+
+        {/* =================================================
+            CHECK-IN
+            ================================================= */}
+
+        <section className="card">
+
+          <h2>🚗 Vehicle Check-In</h2>
+
+          <form
+            className="form-grid"
+            onSubmit={handleCheckIn}
+          >
+
             <input
-              placeholder="Search plate"
-              value={search}
+              placeholder="Vehicle plate e.g. RJ14AB1234"
+              value={plate}
               onChange={(e) =>
-                setSearch(e.target.value)
+                setPlate(e.target.value)
+              }
+              required
+            />
+
+            <select
+              value={vehicleType}
+              onChange={(e) =>
+                setVehicleType(e.target.value)
+              }
+            >
+              <option value="STANDARD">
+                STANDARD
+              </option>
+
+              <option value="COMPACT">
+                COMPACT
+              </option>
+
+              <option value="EV">
+                EV
+              </option>
+            </select>
+
+            <select
+              value={selectedSpot}
+              onChange={(e) =>
+                setSelectedSpot(e.target.value)
+              }
+            >
+
+              <option value="">
+                Auto Assign Spot
+              </option>
+
+              {spots
+                .filter(
+                  (spot) =>
+                    !spot.is_occupied &&
+                    spot.spot_type ===
+                      vehicleType
+                )
+                .map((spot) => (
+                  <option
+                    key={spot.id}
+                    value={spot.id}
+                  >
+                    Floor {spot.floor} • Spot{" "}
+                    {spot.spot_number} •{" "}
+                    {spot.spot_type}
+                  </option>
+                ))}
+
+            </select>
+
+            <button
+              className="primary-btn"
+              type="submit"
+            >
+              Check In
+            </button>
+
+          </form>
+
+        </section>
+
+
+        {/* =================================================
+            ACTIVE VEHICLES
+            ================================================= */}
+
+        <section className="card">
+
+          <div className="section-header">
+
+            <div>
+              <h2>🅿️ Active Vehicles</h2>
+              <p>
+                Currently parked vehicles
+              </p>
+            </div>
+
+            <button
+              className="secondary-btn"
+              onClick={loadDashboard}
+            >
+              Refresh
+            </button>
+
+          </div>
+
+          {activeSessions.length === 0 ? (
+            <div className="empty">
+              No active vehicles.
+            </div>
+          ) : (
+            <div className="table-wrapper">
+
+              <table>
+
+                <thead>
+                  <tr>
+                    <th>Plate</th>
+                    <th>Type</th>
+                    <th>Spot</th>
+                    <th>Check-In</th>
+                    <th>Action</th>
+                  </tr>
+                </thead>
+
+                <tbody>
+
+                  {activeSessions.map(
+                    (session) => (
+                      <tr key={session.id}>
+
+                        <td>
+                          <strong>
+                            {session.vehicle_plate}
+                          </strong>
+                        </td>
+
+                        <td>
+                          {session.vehicle_type}
+                        </td>
+
+                        <td>
+                          #{session.spot_id}
+                        </td>
+
+                        <td>
+                          {formatDate(
+                            session.check_in_time
+                          )}
+                        </td>
+
+                        <td>
+
+                          <button
+                            className="danger-btn"
+                            onClick={() =>
+                              handleCheckout(
+                                session.vehicle_plate
+                              )
+                            }
+                          >
+                            Check Out
+                          </button>
+
+                        </td>
+
+                      </tr>
+                    )
+                  )}
+
+                </tbody>
+
+              </table>
+
+            </div>
+          )}
+
+        </section>
+
+
+        {/* =================================================
+            SEARCH
+            ================================================= */}
+
+        <section className="card">
+
+          <h2>🔎 Search Vehicle</h2>
+
+          <form
+            className="search-form"
+            onSubmit={handleSearch}
+          >
+
+            <input
+              placeholder="Search by vehicle plate"
+              value={searchPlate}
+              onChange={(e) =>
+                setSearchPlate(e.target.value)
               }
             />
 
             <button
-              onClick={searchVehicle}
+              className="primary-btn"
+              type="submit"
             >
               Search
             </button>
-          </div>
-        </div>
 
-        <div className="table-wrap">
-          <table>
-            <thead>
-              <tr>
-                <th>Plate</th>
-                <th>Type</th>
-                <th>Spot</th>
-                <th>Check-In</th>
-                <th>Check-Out</th>
-                <th>Duration</th>
-                <th>Fee</th>
-                <th>Status</th>
-              </tr>
-            </thead>
+          </form>
 
-            <tbody>
-              {history.length === 0 ? (
-                <tr>
-                  <td colSpan="8">
-                    No parking history found.
-                  </td>
-                </tr>
-              ) : (
-                history.map((item) => (
-                  <tr key={item.id}>
-                    <td>
-                      {item.vehicle_plate}
-                    </td>
+          {searchResults.length > 0 && (
+            <div className="table-wrapper">
 
-                    <td>
-                      {item.vehicle_type}
-                    </td>
+              <table>
 
-                    <td>
-                      {item.spot_id}
-                    </td>
-
-                    <td>
-                      {new Date(
-                        item.check_in_time
-                      ).toLocaleString()}
-                    </td>
-
-                    <td>
-                      {item.check_out_time
-                        ? new Date(
-                            item.check_out_time
-                          ).toLocaleString()
-                        : "-"}
-                    </td>
-
-                    <td>
-                      {item.duration_minutes ??
-                        "-"}{" "}
-                      min
-                    </td>
-
-                    <td>
-                      {item.fee !== null &&
-                      item.fee !== undefined
-                        ? `₹${item.fee}`
-                        : "-"}
-                    </td>
-
-                    <td>
-                      {item.status}
-                    </td>
+                <thead>
+                  <tr>
+                    <th>Plate</th>
+                    <th>Type</th>
+                    <th>Spot</th>
+                    <th>Status</th>
+                    <th>Fee</th>
                   </tr>
-                ))
+                </thead>
+
+                <tbody>
+
+                  {searchResults.map(
+                    (item) => (
+                      <tr key={item.id}>
+
+                        <td>
+                          {item.vehicle_plate}
+                        </td>
+
+                        <td>
+                          {item.vehicle_type}
+                        </td>
+
+                        <td>
+                          #{item.spot_id}
+                        </td>
+
+                        <td>
+                          {item.status}
+                        </td>
+
+                        <td>
+                          ₹{item.fee ?? "-"}
+                        </td>
+
+                      </tr>
+                    )
+                  )}
+
+                </tbody>
+
+              </table>
+
+            </div>
+          )}
+
+        </section>
+
+
+        {/* =================================================
+            PARKING HISTORY
+            ================================================= */}
+
+        <section className="card">
+
+          <div className="section-header">
+
+            <div>
+              <h2>📋 Parking History</h2>
+              <p>
+                Persistent parking records
+              </p>
+            </div>
+
+            {history && (
+              <span>
+                Total: {history.total}
+              </span>
+            )}
+
+          </div>
+
+          {history?.results?.length > 0 ? (
+
+            <div className="table-wrapper">
+
+              <table>
+
+                <thead>
+                  <tr>
+                    <th>Plate</th>
+                    <th>Type</th>
+                    <th>Check-In</th>
+                    <th>Check-Out</th>
+                    <th>Duration</th>
+                    <th>Fee</th>
+                    <th>Status</th>
+                  </tr>
+                </thead>
+
+                <tbody>
+
+                  {history.results.map(
+                    (item) => (
+                      <tr key={item.id}>
+
+                        <td>
+                          {item.vehicle_plate}
+                        </td>
+
+                        <td>
+                          {item.vehicle_type}
+                        </td>
+
+                        <td>
+                          {formatDate(
+                            item.check_in_time
+                          )}
+                        </td>
+
+                        <td>
+                          {item.check_out_time
+                            ? formatDate(
+                                item.check_out_time
+                              )
+                            : "-"}
+                        </td>
+
+                        <td>
+                          {item.duration_minutes
+                            ? `${item.duration_minutes} min`
+                            : "-"}
+                        </td>
+
+                        <td>
+                          {item.fee != null
+                            ? `₹${item.fee}`
+                            : "-"}
+                        </td>
+
+                        <td>
+                          <span
+                            className={
+                              item.status ===
+                              "ACTIVE"
+                                ? "status-active"
+                                : "status-complete"
+                            }
+                          >
+                            {item.status}
+                          </span>
+                        </td>
+
+                      </tr>
+                    )
+                  )}
+
+                </tbody>
+
+              </table>
+
+            </div>
+
+          ) : (
+            <div className="empty">
+              No parking history yet.
+            </div>
+          )}
+
+          {history &&
+            history.total_pages > 0 && (
+              <div className="pagination">
+
+                <button
+                  disabled={page <= 1}
+                  onClick={() =>
+                    setPage((p) =>
+                      Math.max(1, p - 1)
+                    )
+                  }
+                >
+                  ← Previous
+                </button>
+
+                <span>
+                  Page {page} of{" "}
+                  {history.total_pages}
+                </span>
+
+                <button
+                  disabled={
+                    page >= history.total_pages
+                  }
+                  onClick={() =>
+                    setPage((p) =>
+                      Math.min(
+                        history.total_pages,
+                        p + 1
+                      )
+                    )
+                  }
+                >
+                  Next →
+                </button>
+
+              </div>
+            )}
+
+        </section>
+
+
+        {/* =================================================
+            T6 TRANSFER
+            ================================================= */}
+
+        <section className="card">
+
+          <h2>🔄 Valet Hand-Off</h2>
+
+          <p className="muted">
+            Transfer an active session to a
+            different vehicle plate. Spot and
+            original entry time remain unchanged.
+          </p>
+
+          <form
+            className="form-grid"
+            onSubmit={handleTransfer}
+          >
+
+            <input
+              placeholder="Old plate"
+              value={oldPlate}
+              onChange={(e) =>
+                setOldPlate(e.target.value)
+              }
+              required
+            />
+
+            <input
+              placeholder="New plate"
+              value={newPlate}
+              onChange={(e) =>
+                setNewPlate(e.target.value)
+              }
+              required
+            />
+
+            <button
+              className="primary-btn"
+              type="submit"
+            >
+              Transfer Session
+            </button>
+
+          </form>
+
+        </section>
+
+
+        {/* =================================================
+            T4 RATE CARD
+            ================================================= */}
+
+        <section className="card">
+
+          <h2>💰 Messy Rate Card Import</h2>
+
+          <p className="muted">
+            Paste a rate card. Valid COMPACT,
+            STANDARD and EV rows are extracted
+            while unrelated junk is ignored.
+          </p>
+
+          <form onSubmit={handleRateCardImport}>
+
+            <textarea
+              rows="7"
+              value={rateCardText}
+              onChange={(e) =>
+                setRateCardText(
+                  e.target.value
+                )
+              }
+            />
+
+            <button
+              className="primary-btn"
+              type="submit"
+            >
+              Import Clean Rates
+            </button>
+
+          </form>
+
+          {pricing?.rate_cards?.length > 0 && (
+            <div className="rate-grid">
+
+              {pricing.rate_cards.map(
+                (rate) => (
+                  <div
+                    className="rate-card"
+                    key={rate.spot_type}
+                  >
+                    <h3>
+                      {rate.spot_type}
+                    </h3>
+
+                    <p>
+                      First hour: ₹
+                      {rate.first_hour_rate}
+                    </p>
+
+                    <p>
+                      Additional hour: ₹
+                      {rate.additional_hour_rate}
+                    </p>
+
+                    <p>
+                      Daily cap: ₹
+                      {rate.daily_cap}
+                    </p>
+
+                  </div>
+                )
               )}
-            </tbody>
-          </table>
-        </div>
-      </section>
 
-      <footer>
-        <p>
-          ParkEase — Parking Garage Management
-          System
-        </p>
+            </div>
+          )}
 
-        <p>
-          React • FastAPI • SQLAlchemy • SQLite
-        </p>
-      </footer>
+        </section>
+
+
+        {/* =================================================
+            T2 CLOCK
+            ================================================= */}
+
+        <section className="card">
+
+          <h2>⏰ Nightly Automation</h2>
+
+          <p className="muted">
+            Automatically closes and bills
+            sessions parked for more than
+            24 hours.
+          </p>
+
+          <form
+            className="form-grid"
+            onSubmit={handleClock}
+          >
+
+            <input
+              type="datetime-local"
+              value={clockTime}
+              onChange={(e) =>
+                setClockTime(
+                  e.target.value
+                    ? `${e.target.value}:00`
+                    : ""
+                )
+              }
+            />
+
+            <button
+              className="primary-btn"
+              type="submit"
+            >
+              Run Clock Job
+            </button>
+
+          </form>
+
+        </section>
+
+
+        {/* =================================================
+            API DOCS
+            ================================================= */}
+
+        <section className="card api-card">
+
+          <h2>🧩 API Documentation</h2>
+
+          <p>
+            Explore and test all REST APIs using
+            FastAPI Swagger.
+          </p>
+
+          <a
+            href={`${API}/docs`}
+            target="_blank"
+            rel="noreferrer"
+          >
+            Open API Docs →
+          </a>
+
+        </section>
+
+      </main>
+
     </div>
   );
 }
 
-export default App;
+
+/* =========================================================
+   STAT CARD
+   ========================================================= */
+
+function StatCard({ title, value }) {
+  return (
+    <div className="stat-card">
+      <span>{title}</span>
+      <strong>{value}</strong>
+    </div>
+  );
+}
+
+
+/* =========================================================
+   LANDING SECTION
+   ========================================================= */
+
+function LandingSection() {
+  return (
+    <section className="landing">
+
+      <div className="landing-inner">
+
+        <h2>
+          Built for modern parking operations
+        </h2>
+
+        <p>
+          ParkEase helps parking attendants and
+          garage operators manage multi-level
+          garages, EV spots, vehicle check-in/out,
+          pricing, search and parking history from
+          one dashboard.
+        </p>
+
+
+        <div className="feature-grid">
+
+          <div>
+            🚗
+            <strong>Smart Check-In</strong>
+            <span>
+              Automatic spot assignment
+            </span>
+          </div>
+
+          <div>
+            ⚡
+            <strong>EV Management</strong>
+            <span>
+              Dedicated EV availability
+            </span>
+          </div>
+
+          <div>
+            💰
+            <strong>Automatic Billing</strong>
+            <span>
+              Tiered rates and daily caps
+            </span>
+          </div>
+
+          <div>
+            🔎
+            <strong>Plate Search</strong>
+            <span>
+              Quickly find parking records
+            </span>
+          </div>
+
+          <div>
+            📋
+            <strong>Parking History</strong>
+            <span>
+              Persistent database records
+            </span>
+          </div>
+
+          <div>
+            🏢
+            <strong>Multi-Level Garage</strong>
+            <span>
+              Designed for scalable garages
+            </span>
+          </div>
+
+        </div>
+
+
+        <h3>Target Audience</h3>
+
+        <p>
+          Parking garage attendants, operators
+          and city-centre parking businesses.
+        </p>
+
+
+        <h3>How ParkEase Helps</h3>
+
+        <p>
+          It reduces manual parking tracking,
+          prevents double parking, enforces EV
+          spot rules, calculates fees consistently
+          and keeps searchable parking history.
+        </p>
+
+
+        <h3>Future Features</h3>
+
+        <ul>
+          <li>Online reservations</li>
+          <li>Payment gateway integration</li>
+          <li>Real-time analytics and notifications</li>
+        </ul>
+
+      </div>
+
+    </section>
+  );
+}
+
+
+/* =========================================================
+   DATE FORMATTER
+   ========================================================= */
+
+function formatDate(value) {
+  if (!value) return "-";
+
+  try {
+    return new Date(value).toLocaleString();
+  } catch {
+    return value;
+  }
+}

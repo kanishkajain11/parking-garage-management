@@ -1,31 +1,40 @@
-# ParkEase - Parking Garage Management System
+cat > README.md <<'EOF'
+# ParkEase 🚗
 
-ParkEase is a full-stack parking garage management system built for busy multi-level city-centre garages.
+ParkEase is a full-stack parking garage management system built for a busy multi-level parking garage.
 
-It helps attendants check vehicles in and out, assign suitable parking spots, calculate parking fees, track EV availability, search vehicle history, and prevent double parking.
+The idea is simple: parking attendants should be able to check vehicles in, assign the right parking spot, check them out, calculate the correct fee, and quickly find parking records when needed.
+
+The system also handles EV parking, parking history, configurable rates, long-running sessions, messy rate-card imports, and valet vehicle hand-offs.
+
+---
 
 ## Features
 
-- Multi-level parking garage
-- Compact, Standard and EV spots
-- EV vehicles restricted to EV spots
-- Automatic suitable spot assignment
-- Manual spot selection
-- Check-in and check-out
-- Tiered hourly pricing
-- Part-hours rounded up
-- Daily fee cap
-- Persistent SQLite database
-- Vehicle search by plate
-- Parking history
-- Pagination
-- Server-side sorting
 - User registration and login
-- Messy rate-card import
-- Automatic 24+ hour session closing through `/clock`
-- Valet plate transfer
+- JWT-based authentication
+- Multi-level parking garage management
+- COMPACT, STANDARD and EV parking spots
+- Automatic parking spot assignment
+- EV vehicles can only use EV spots
+- Live parking and EV availability
+- Vehicle check-in and check-out
+- Parking fee calculation
+- First-hour rate, additional-hour rate and daily cap
+- Partial hours rounded up
+- Parking history
+- Vehicle search by number plate
+- Server-side pagination and sorting
+- Configurable parking rates
+- Messy rate-card import and cleaning
+- Automatic billing for sessions parked over 24 hours
+- Valet hand-off / vehicle plate transfer
+- Persistent SQLite database
+- REST APIs
 - Swagger API documentation
-- React dashboard
+- React-based dashboard
+
+---
 
 ## Tech Stack
 
@@ -34,8 +43,9 @@ It helps attendants check vehicles in and out, assign suitable parking spots, ca
 - FastAPI
 - SQLAlchemy
 - SQLite
-- JWT
 - Pydantic
+- JWT Authentication
+- Passlib
 
 ### Frontend
 - React
@@ -43,14 +53,27 @@ It helps attendants check vehicles in and out, assign suitable parking spots, ca
 - JavaScript
 - CSS
 
-## Setup
+---
 
-### Backend
+## Project Structure
 
-```bash
-cd backend
-python -m venv venv
-source venv/bin/activate
-pip install -r requirements.txt
-python seed.py
-uvicorn main:app --reload --host 0.0.0.0 --port 8000
+```text
+parking-garage-management/
+│
+├── backend/
+│   ├── main.py
+│   ├── models.py
+│   ├── schemas.py
+│   ├── database.py
+│   ├── auth.py
+│   └── seed.py
+│
+├── frontend/
+│   ├── src/
+│   │   └── App.jsx
+│   ├── package.json
+│   └── vite.config.js
+│
+├── README.md
+├── REASONING.md
+└── AI_LOGS.md
