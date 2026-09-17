@@ -46,7 +46,6 @@ It helps attendants check vehicles in and out, assign suitable parking spots, ca
 ## Setup
 
 ### Backend
-
 ```bash
 cd backend
 python -m venv venv
